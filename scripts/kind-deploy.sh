@@ -1,0 +1,136 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+CHART_DIR="${ROOT_DIR}/charts/edit-mind"
+CLUSTER_NAME="${KIND_CLUSTER_NAME:-edit-mind}"
+NAMESPACE="${KIND_NAMESPACE:-edit-mind}"
+RELEASE_NAME="${HELM_RELEASE_NAME:-edit-mind}"
+MEDIA_PATH="${MEDIA_PATH:-${ROOT_DIR}/media}"
+NODE_MEDIA_PATH="${KIND_NODE_MEDIA_PATH:-/media/videos}"
+WEB_PORT="${WEB_PORT:-3745}"
+NODE_PORT="${NODE_PORT:-30080}"
+POSTGRES_PASSWORD="${POSTGRES_PASSWORD:-}"
+SESSION_SECRET="${SESSION_SECRET:-}"
+ENCRYPTION_KEY="${ENCRYPTION_KEY:-}"
+
+require_command() {
+  if ! command -v "$1" >/dev/null 2>&1; then
+    echo "Missing required command: $1" >&2
+    exit 1
+  fi
+}
+
+require_command docker
+require_command kind
+require_command kubectl
+require_command helm
+require_command openssl
+require_command realpath
+require_command base64
+
+is_system_path() {
+  local path="$1"
+  local system_dirs=(/ /bin /boot /dev /etc /lib /lib64 /proc /root /run /sbin /sys /usr /var)
+
+  for dir in "${system_dirs[@]}"; do
+    if [ "${path}" = "${dir}" ] || [[ "${path}" == "${dir}/"* ]]; then
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+chart_fullname() {
+  if [[ "${RELEASE_NAME}" == *edit-mind* ]]; then
+    printf '%s' "${RELEASE_NAME}"
+  else
+    printf '%s-edit-mind' "${RELEASE_NAME}"
+  fi
+}
+
+reuse_secret_value() {
+  local secret_name="$1"
+  local key="$2"
+  local encoded
+
+  encoded="$(kubectl -n "${NAMESPACE}" get secret "${secret_name}" -o "jsonpath={.data.${key}}" 2>/dev/null || true)"
+  if [ -n "${encoded}" ]; then
+    if ! printf '%s' "${encoded}" | base64 --decode 2>/dev/null; then
+      printf '%s' "${encoded}" | base64 -D
+    fi
+  fi
+}
+
+mkdir -p "${MEDIA_PATH}"
+MEDIA_PATH_REAL="$(realpath "${MEDIA_PATH}")"
+
+if is_system_path "${MEDIA_PATH_REAL}"; then
+  echo "MEDIA_PATH points to a system directory. Choose a dedicated media directory." >&2
+  exit 1
+fi
+
+if [ ! -d "${MEDIA_PATH_REAL}" ] || [ ! -r "${MEDIA_PATH_REAL}" ]; then
+  echo "MEDIA_PATH must be a readable directory: ${MEDIA_PATH}" >&2
+  exit 1
+fi
+
+KIND_CONFIG="$(mktemp)"
+trap 'rm -f "${KIND_CONFIG}"' EXIT
+
+cat > "${KIND_CONFIG}" <<CONFIG
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+nodes:
+  - role: control-plane
+    extraPortMappings:
+      - containerPort: ${NODE_PORT}
+        hostPort: ${WEB_PORT}
+        protocol: TCP
+    extraMounts:
+      - hostPath: ${MEDIA_PATH_REAL}
+        containerPath: ${NODE_MEDIA_PATH}
+CONFIG
+
+if ! kind get clusters | grep -qx "${CLUSTER_NAME}"; then
+  kind create cluster --name "${CLUSTER_NAME}" --config "${KIND_CONFIG}"
+else
+  echo "Using existing Kind cluster '${CLUSTER_NAME}'."
+  echo "Ensure it was created with host port ${WEB_PORT}->${NODE_PORT} and media mount ${MEDIA_PATH_REAL}->${NODE_MEDIA_PATH}."
+fi
+
+kubectl config use-context "kind-${CLUSTER_NAME}"
+kubectl create namespace "${NAMESPACE}" --dry-run=client -o yaml | kubectl apply -f -
+
+SECRET_NAME="$(chart_fullname)-secrets"
+POSTGRES_PASSWORD="${POSTGRES_PASSWORD:-$(reuse_secret_value "${SECRET_NAME}" POSTGRES_PASSWORD)}"
+SESSION_SECRET="${SESSION_SECRET:-$(reuse_secret_value "${SECRET_NAME}" SESSION_SECRET)}"
+ENCRYPTION_KEY="${ENCRYPTION_KEY:-$(reuse_secret_value "${SECRET_NAME}" ENCRYPTION_KEY)}"
+POSTGRES_PASSWORD="${POSTGRES_PASSWORD:-$(openssl rand -hex 24)}"
+SESSION_SECRET="${SESSION_SECRET:-$(openssl rand -hex 32)}"
+ENCRYPTION_KEY="${ENCRYPTION_KEY:-$(openssl rand -base64 32)}"
+
+helm upgrade --install "${RELEASE_NAME}" "${CHART_DIR}" \
+  --namespace "${NAMESPACE}" \
+  --set media.hostPath="${NODE_MEDIA_PATH}" \
+  --set media.mountPath="${NODE_MEDIA_PATH}" \
+  --set web.port="${WEB_PORT}" \
+  --set web.service.nodePort="${NODE_PORT}" \
+  --set secrets.postgresPassword="${POSTGRES_PASSWORD}" \
+  --set secrets.sessionSecret="${SESSION_SECRET}" \
+  --set secrets.encryptionKey="${ENCRYPTION_KEY}" \
+  "$@"
+
+cat <<MESSAGE
+
+Edit Mind is being deployed to Kind cluster '${CLUSTER_NAME}'.
+
+Media directory: ${MEDIA_PATH_REAL}
+Namespace: ${NAMESPACE}
+Release: ${RELEASE_NAME}
+URL: http://localhost:${WEB_PORT}
+
+Check rollout status with:
+  kubectl -n ${NAMESPACE} get pods
+MESSAGE
